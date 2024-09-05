@@ -11,6 +11,7 @@ import (
 	"github.com/go-logr/logr"
 	redhatcopv1alpha1 "github.com/redhat-cop/podpreset-webhook/api/v1alpha1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/labels"
@@ -22,6 +23,15 @@ import (
 const (
 	annotationPrefix = "podpreset.admission.kubernetes.io"
 )
+
+var log logr.Logger
+
+func init() {
+	var opts = zap.Options{
+		Development: true,
+	}
+	log = zap.New(zap.UseFlagOptions(&opts)).WithName("PodPreset")
+}
 
 // +kubebuilder:webhook:path=/mutate,mutating=true,failurePolicy=ignore,groups="",resources=pods,verbs=create,versions=v1,name=mpod.redhatcop.redhat.io,sideEffects=None,admissionReviewVersions={v1,v1beta1}
 // +kubebuilder:rbac:groups=redhatcop.redhat.io,resources=podpresets,verbs=get;list;watch;create;update;patch
@@ -54,12 +64,14 @@ func (a *PodPresetMutator) Handle(ctx context.Context, req admission.Request) ad
 	// Begin Mutation
 
 	if _, isMirrorPod := pod.Annotations[corev1.MirrorPodAnnotationKey]; isMirrorPod {
+		logger.Info("Mirror Pod", "Pod GenerateName", pod.GetGenerateName())
 		return admission.Allowed("Mirror Pod")
 	}
 
 	// Ignore if exclusion annotation is present
 	if podAnnotations := pod.GetAnnotations(); podAnnotations != nil {
 		if podAnnotations[corev1.PodPresetOptOutAnnotationKey] == "true" {
+			logger.Info("Exclusion Annotation Present", "Pod GenerateName", pod.GetGenerateName())
 			return admission.Allowed("Exclusion Annotation Present")
 		}
 	}
@@ -78,9 +90,10 @@ func (a *PodPresetMutator) Handle(ctx context.Context, req admission.Request) ad
 	}
 
 	if len(matchingPPs) == 0 {
+		logger.Info("matchingPPs is null", "Pod GenerateName", pod.GetGenerateName())
 		return admission.Allowed("")
 	}
-
+	logger.Info("Mutating pod", "Pod GenerateName", pod.GetGenerateName())
 	presetNames := make([]string, len(matchingPPs))
 	for i, pp := range matchingPPs {
 		presetNames[i] = pp.GetName()
@@ -257,10 +270,18 @@ func mergeEnvFrom(envSources []corev1.EnvFromSource, podPresets []*redhatcopv1al
 // injected by given podPresets. It returns an error if it detects any conflict during the merge.
 func mergeVolumeMounts(volumeMounts []corev1.VolumeMount, podPresets []*redhatcopv1alpha1.PodPreset) ([]corev1.VolumeMount, error) {
 
+	logger := log.WithName("mergeVolumeMounts")
+
 	origVolumeMounts := map[string]corev1.VolumeMount{}
 	volumeMountsByPath := map[string]corev1.VolumeMount{}
 	for _, v := range volumeMounts {
-		origVolumeMounts[v.Name] = v
+		if v.SubPath != "" {
+			logger.Info("subPath is set for origVolumeMounts", "Name", v.Name, "SubPath", v.SubPath)
+			origVolumeMounts[v.Name+v.SubPath] = v
+		} else {
+			origVolumeMounts[v.Name] = v
+		}
+
 		volumeMountsByPath[v.MountPath] = v
 	}
 
@@ -272,10 +293,22 @@ func mergeVolumeMounts(volumeMounts []corev1.VolumeMount, podPresets []*redhatco
 	for _, pp := range podPresets {
 		for _, v := range pp.Spec.VolumeMounts {
 
-			found, ok := origVolumeMounts[v.Name]
+			var (
+				found corev1.VolumeMount
+				ok    bool
+			)
+			if v.SubPath != "" {
+				logger.Info("subPath is set for podPresets", "Name", v.Name, "SubPath", v.SubPath)
+				found, ok = origVolumeMounts[v.Name+v.SubPath]
+			} else {
+				found, ok = origVolumeMounts[v.Name]
+			}
+
 			if !ok {
 				// if we don't already have it append it and continue
-				origVolumeMounts[v.Name] = v
+				if v.SubPath != "" {
+					origVolumeMounts[v.Name+v.SubPath] = v
+				}
 				mergedVolumeMounts = append(mergedVolumeMounts, v)
 			} else {
 				// make sure they are identical or throw an error
@@ -302,7 +335,7 @@ func mergeVolumeMounts(volumeMounts []corev1.VolumeMount, podPresets []*redhatco
 	if err != nil {
 		return nil, err
 	}
-
+	logger.Info("mergedVolumeMounts --> ", "mergedVolumeMounts", mergedVolumeMounts)
 	return mergedVolumeMounts, err
 }
 
